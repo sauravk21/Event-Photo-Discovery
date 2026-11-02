@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event Photo Finder</title>
+<style>
+  :root { --bg:#fafafa; --card:#fff; --fg:#1a1a1a; --muted:#6b7280; --line:#e5e7eb; --accent:#4f46e5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#181b21; --fg:#e8e8e8; --muted:#9aa0aa; --line:#2a2f38; --accent:#818cf8; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 24px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:20px; }
+  h2 { font-size:1.1rem; margin:0 0 12px; }
+  label { display:block; font-size:.85rem; color:var(--muted); margin-bottom:4px; }
+  input[type=text] { width:100%; max-width:280px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:inherit; }
+  input[type=file] { display:block; margin:12px 0; max-width:100%; }
+  button { padding:8px 16px; border:0; border-radius:8px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .status { margin-top:12px; color:var(--muted); font-size:.9rem; min-height:1.4em; }
+  .status.error { color:#dc2626; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:10px; margin-top:16px; }
+  .grid a { display:block; aspect-ratio:1; border-radius:8px; overflow:hidden; border:1px solid var(--line); }
+  .grid img { width:100%; height:100%; object-fit:cover; display:block; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Event Photo Finder</h1>
+  <p class="sub">Upload an event's photos once. Anyone can then find theirs with a selfie.</p>
+
+  <section>
+    <label for="event">Event name</label>
+    <input id="event" type="text" value="demo" maxlength="64">
+  </section>
+
+  <section>
+    <h2>1. Upload event photos</h2>
+    <input id="photos" type="file" accept="image/jpeg,image/png,image/webp" multiple>
+    <button id="upload">Upload</button>
+    <div id="upload-status" class="status"></div>
+  </section>
+
+  <section>
+    <h2>2. Find my photos</h2>
+    <input id="selfie" type="file" accept="image/*" capture="user">
+    <button id="search">Search</button>
+    <div id="search-status" class="status"></div>
+    <div id="results" class="grid"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const eventId = () => $("event").value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "demo";
+const say = (id, text, isError = false) => { const el = $(id); el.textContent = text; el.classList.toggle("error", isError); };
+
+// Keep the event name across reloads: ?event=... (a shareable link) wins, then the last one used.
+const lastEvent = () => { try { return localStorage.getItem("event"); } catch { return null; } };
+$("event").value = new URLSearchParams(location.search).get("event") || lastEvent() || "demo";
+$("event").addEventListener("change", () => {
+  const ev = eventId();
+  $("event").value = ev;
+  try { localStorage.setItem("event", ev); } catch {}
+  history.replaceState(null, "", `?event=${encodeURIComponent(ev)}`);
+});
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || `Request failed (${res.status})`);
+  return body;
+}
+
+$("upload").onclick = async () => {
+  const files = [...$("photos").files];
+  if (!files.length) return say("upload-status", "Choose some photos first.", true);
+  const ev = eventId();
+  $("upload").disabled = true;
+  try {
+    const BATCH = 10; // keeps each request small enough to survive flaky connections
+    for (let i = 0; i < files.length; i += BATCH) {
+      say("upload-status", `Uploading ${Math.min(i + BATCH, files.length)} / ${files.length}…`);
+      const form = new FormData();
+      files.slice(i, i + BATCH).forEach((f) => form.append("files", f));
+      await api(`/api/events/${ev}/photos`, { method: "POST", body: form });
+    }
+    await pollProcessing(ev);
+  } catch (e) {
+    say("upload-status", e.message, true);
+  } finally {
+    $("upload").disabled = false;
+  }
+};
+
+async function pollProcessing(ev) {
+  for (;;) {
+    const s = await api(`/api/events/${ev}`);
+    const failed = s.failed ? ` · ${s.failed} failed` : "";
+    if (s.in_progress === 0) return say("upload-status", `Done. ${s.done} photos processed, ${s.faces} faces indexed${failed}.`);
+    say("upload-status", `Processing… ${s.done} / ${s.total} done${failed}`);
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+}
+
+$("search").onclick = async () => {
+  const file = $("selfie").files[0];
+  if (!file) return say("search-status", "Choose a selfie first.", true);
+  const ev = eventId();
+  $("search").disabled = true;
+  $("results").replaceChildren();
+  say("search-status", `Searching event "${ev}"…`);
+  try {
+    const form = new FormData();
+    form.append("selfie", file);
+    const { matches, photos_still_processing } = await api(`/api/events/${ev}/search`, { method: "POST", body: form });
+    const note = photos_still_processing ? ` (${photos_still_processing} photos still processing, so this may be incomplete)` : "";
+    say("search-status", matches.length ? `Found you in ${matches.length} photo${matches.length === 1 ? "" : "s"}${note}.` : `No matches in event "${ev}"${note}. Check it's the event name the photos were uploaded to.`);
+    for (const m of matches) {
+      const a = document.createElement("a");
+      a.href = m.url; a.target = "_blank"; a.title = `match ${m.score}`;
+      const img = document.createElement("img");
+      img.src = m.url; img.loading = "lazy";
+      a.append(img);
+      $("results").append(a);
+    }
+  } catch (e) {
+    say("search-status", e.message, true);
+  } finally {
+    $("search").disabled = false;
+  }
+};
+</script>
+</body>
+</html>
